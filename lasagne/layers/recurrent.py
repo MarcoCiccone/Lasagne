@@ -66,7 +66,7 @@ from ..utils import unroll_scan
 
 from .base import MergeLayer, Layer
 from .input import InputLayer
-from .normalization import batch_norm
+from .normalization import BatchNormLayer
 from .dense import DenseLayer
 from . import helper
 
@@ -75,7 +75,8 @@ __all__ = [
     "RecurrentLayer",
     "Gate",
     "LSTMLayer",
-    "GRULayer"
+    "GRULayer",
+    "BNGRULayer"
 ]
 
 
@@ -1517,6 +1518,13 @@ class BNGRULayer(GRULayer):
         self.mean = mean
         self.inv_std = inv_std
 
+        # create BN layer for correct input shape
+        shape_bn = incoming.get_output_shape_for()
+        shape_bn = (shape_bn[1], shape_bn[0], num_units)
+
+        self.bn = BatchNormLayer(shape_bn)
+        self.params.update(self.bn.params)
+
         # Initialize parent layer
         super(BNGRULayer, self).__init__(
             incoming,
@@ -1594,8 +1602,17 @@ class BNGRULayer(GRULayer):
         if self.precompute_input:
             # precompute_input inputs*W. W_in is (n_features, 3*num_units).
             # input is then (n_batch, n_time_steps, 3*num_units).
-            input = batch_norm(T.dot(input, W_in_stacked) +
-                               b_stacked)
+            input = T.dot(input, W_in_stacked)
+            input = self.bn.get_output_for(
+                input,
+                axes=self.axes,
+                epsilon=self.epsilon,
+                alpha=self.alpha,
+                mode=self.mode,
+                beta=self.beta,
+                gamma=self.gamma,
+                mean=self.mean,
+                inv_std=self.inv_std)
 
         # At each call to scan, input_n will be (n_time_steps, 3*num_units).
         # We define a slicing function that extract the input to each GRU gate
