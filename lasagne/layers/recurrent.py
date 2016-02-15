@@ -1509,19 +1509,6 @@ class BNGRULayer(GRULayer):
                  inv_std=init.Constant(1),
                  **kwargs):
 
-        # create BN layer for correct input shape
-        shape_bn = (None, None, num_units)
-        self.bn = BatchNormLayer(shape_bn,
-                                 axes=axes,
-                                 epsilon=epsilon,
-                                 alpha=alpha,
-                                 mode=mode,
-                                 beta=beta,
-                                 gamma=gamma,
-                                 mean=mean,
-                                 inv_std=inv_std)
-        self.params.update(self.bn.params)
-
         # Initialize parent layer
         super(BNGRULayer, self).__init__(
             incoming,
@@ -1539,6 +1526,19 @@ class BNGRULayer(GRULayer):
             mask_input,
             only_return_final,
             **kwargs)
+
+        # create BN layer for correct input shape
+        shape_bn = (None, None, num_units)
+        self.bn = BatchNormLayer(shape_bn,
+                                 axes=axes,
+                                 epsilon=epsilon,
+                                 alpha=alpha,
+                                 mode=mode,
+                                 beta=beta,
+                                 gamma=gamma,
+                                 mean=mean,
+                                 inv_std=inv_std)
+        self.params.update(self.bn.params)
 
     def get_output_for(self, inputs, **kwargs):
         """
