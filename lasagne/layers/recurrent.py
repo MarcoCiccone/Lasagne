@@ -1529,7 +1529,7 @@ class BNGRULayer(GRULayer):
             **kwargs)
 
         # create BN layer for correct input shape
-        shape_bn = (None, None, num_units)
+        shape_bn = (None, None, 3*num_units)
         self.bn = BatchNormLayer(shape_bn,
                                  axes=axes,
                                  epsilon=epsilon,
