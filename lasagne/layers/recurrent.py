@@ -66,6 +66,7 @@ from ..utils import unroll_scan
 
 from .base import MergeLayer, Layer
 from .input import InputLayer
+from .normalization import batch_norm
 from .dense import DenseLayer
 from . import helper
 
@@ -1370,6 +1371,231 @@ class GRULayer(MergeLayer):
             # precompute_input inputs*W. W_in is (n_features, 3*num_units).
             # input is then (n_batch, n_time_steps, 3*num_units).
             input = T.dot(input, W_in_stacked) + b_stacked
+
+        # At each call to scan, input_n will be (n_time_steps, 3*num_units).
+        # We define a slicing function that extract the input to each GRU gate
+        def slice_w(x, n):
+            return x[:, n*self.num_units:(n+1)*self.num_units]
+
+        # Create single recurrent computation step function
+        # input__n is the n'th vector of the input
+        def step(input_n, hid_previous, *args):
+            # Compute W_{hr} h_{t - 1}, W_{hu} h_{t - 1}, and W_{hc} h_{t - 1}
+            hid_input = T.dot(hid_previous, W_hid_stacked)
+
+            if self.grad_clipping:
+                input_n = theano.gradient.grad_clip(
+                    input_n, -self.grad_clipping, self.grad_clipping)
+                hid_input = theano.gradient.grad_clip(
+                    hid_input, -self.grad_clipping, self.grad_clipping)
+
+            if not self.precompute_input:
+                # Compute W_{xr}x_t + b_r, W_{xu}x_t + b_u, and W_{xc}x_t + b_c
+                input_n = T.dot(input_n, W_in_stacked) + b_stacked
+
+            # Reset and update gates
+            resetgate = slice_w(hid_input, 0) + slice_w(input_n, 0)
+            updategate = slice_w(hid_input, 1) + slice_w(input_n, 1)
+            resetgate = self.nonlinearity_resetgate(resetgate)
+            updategate = self.nonlinearity_updategate(updategate)
+
+            # Compute W_{xc}x_t + r_t \odot (W_{hc} h_{t - 1})
+            hidden_update_in = slice_w(input_n, 2)
+            hidden_update_hid = slice_w(hid_input, 2)
+            hidden_update = hidden_update_in + resetgate*hidden_update_hid
+            if self.grad_clipping:
+                hidden_update = theano.gradient.grad_clip(
+                    hidden_update, -self.grad_clipping, self.grad_clipping)
+            hidden_update = self.nonlinearity_hid(hidden_update)
+
+            # Compute (1 - u_t)h_{t - 1} + u_t c_t
+            hid = (1 - updategate)*hid_previous + updategate*hidden_update
+            return hid
+
+        def step_masked(input_n, mask_n, hid_previous, *args):
+            hid = step(input_n, hid_previous, *args)
+
+            # Skip over any input with mask 0 by copying the previous
+            # hidden state; proceed normally for any input with mask 1.
+            hid = T.switch(mask_n, hid, hid_previous)
+
+            return hid
+
+        if mask is not None:
+            # mask is given as (batch_size, seq_len). Because scan iterates
+            # over first dimension, we dimshuffle to (seq_len, batch_size) and
+            # add a broadcastable dimension
+            mask = mask.dimshuffle(1, 0, 'x')
+            sequences = [input, mask]
+            step_fun = step_masked
+        else:
+            sequences = [input]
+            step_fun = step
+
+        if not isinstance(self.hid_init, Layer):
+            # Dot against a 1s vector to repeat to shape (num_batch, num_units)
+            hid_init = T.dot(T.ones((num_batch, 1)), self.hid_init)
+
+        # The hidden-to-hidden weight matrix is always used in step
+        non_seqs = [W_hid_stacked]
+        # When we aren't precomputing the input outside of scan, we need to
+        # provide the input weights and biases to the step function
+        if not self.precompute_input:
+            non_seqs += [W_in_stacked, b_stacked]
+
+        if self.unroll_scan:
+            # Retrieve the dimensionality of the incoming layer
+            input_shape = self.input_shapes[0]
+            # Explicitly unroll the recurrence instead of using scan
+            hid_out = unroll_scan(
+                fn=step_fun,
+                sequences=sequences,
+                outputs_info=[hid_init],
+                go_backwards=self.backwards,
+                non_sequences=non_seqs,
+                n_steps=input_shape[1])[0]
+        else:
+            # Scan op iterates over first dimension of input and repeatedly
+            # applies the step function
+            hid_out = theano.scan(
+                fn=step_fun,
+                sequences=sequences,
+                go_backwards=self.backwards,
+                outputs_info=[hid_init],
+                non_sequences=non_seqs,
+                truncate_gradient=self.gradient_steps,
+                strict=True)[0]
+
+        # When it is requested that we only return the final sequence step,
+        # we need to slice it out immediately after scan is applied
+        if self.only_return_final:
+            hid_out = hid_out[-1]
+        else:
+            # dimshuffle back to (n_batch, n_time_steps, n_features))
+            hid_out = hid_out.dimshuffle(1, 0, 2)
+
+            # if scan is backward reverse the output
+            if self.backwards:
+                hid_out = hid_out[:, ::-1]
+
+        return hid_out
+
+
+class BNGRULayer(GRULayer):
+    def __init__(self, incoming,
+                 num_units,
+                 resetgate=Gate(W_cell=None),
+                 updategate=Gate(W_cell=None),
+                 hidden_update=Gate(
+                     W_cell=None,
+                     nonlinearity=nonlinearities.tanh),
+                 hid_init=init.Constant(0.),
+                 backwards=False,
+                 learn_init=False,
+                 gradient_steps=-1,
+                 grad_clipping=0,
+                 unroll_scan=False,
+                 mask_input=None,
+                 only_return_final=False,
+                 # Batch Normalization Params
+                 axes=(0, 1),
+                 epsilon=1e-4,
+                 alpha=0.1,
+                 mode='low_mem',
+                 beta=init.Constant(0),
+                 gamma=init.Constant(1),
+                 mean=init.Constant(0),
+                 inv_std=init.Constant(1),
+                 **kwargs):
+
+        self.axes = axes
+        self.epsilon = epsilon
+        self.alpha = alpha
+        self.mode = mode
+        self.beta = beta
+        self.gamma = gamma
+        self.mean = mean
+        self.inv_std = inv_std
+
+        # Initialize parent layer
+        super(BNGRULayer, self).__init__(
+            incoming,
+            num_units,
+            resetgate,
+            updategate,
+            hidden_update,
+            hid_init,
+            backwards,
+            learn_init,
+            gradient_steps,
+            grad_clipping,
+            unroll_scan,
+            True,  # precompute_input is fixed to True to have BN
+            mask_input,
+            only_return_final,
+            **kwargs)
+
+    def get_output_for(self, inputs, **kwargs):
+        """
+        Override the method in order to have a Batch Normalization layer
+
+
+        see this issue: https://github.com/Lasagne/Lasagne/issues/577
+        Without precompute_input, it's not possible to apply sequence-wise
+        batch normalization. You need to have the results of the
+        input-to-hidden transformation for the full batch and over the
+        full sequence. If you compute it time step by time step,
+        you don't have the necessary statistics available
+
+        (it's possible to normalize using the statistics from what you've seen
+        so far in a sequence, but this doesn't work as well,
+        I think they tried in http://arxiv.org/abs/1510.01378)
+
+        IMPORTANT NOTE:
+        To perform sequence-wise normalization, you'll need to pass
+        axes=(0, 1), so it normalizes over both the mini batch items
+        and time steps.
+        """
+        # Retrieve the layer input
+        input = inputs[0]
+        # Retrieve the mask when it is supplied
+        mask = None
+        hid_init = None
+        if self.mask_incoming_index > 0:
+            mask = inputs[self.mask_incoming_index]
+        if self.hid_init_incoming_index > 0:
+            hid_init = inputs[self.hid_init_incoming_index]
+
+        # Treat all dimensions after the second as flattened feature dimensions
+        if input.ndim > 3:
+            input = T.flatten(input, 3)
+
+        # Because scan iterates over the first dimension we dimshuffle to
+        # (n_time_steps, n_batch, n_features)
+        input = input.dimshuffle(1, 0, 2)
+        seq_len, num_batch, _ = input.shape
+
+        # Stack input weight matrices into a (num_inputs, 3*num_units)
+        # matrix, which speeds up computation
+        W_in_stacked = T.concatenate(
+            [self.W_in_to_resetgate, self.W_in_to_updategate,
+             self.W_in_to_hidden_update], axis=1)
+
+        # Same for hidden weight matrices
+        W_hid_stacked = T.concatenate(
+            [self.W_hid_to_resetgate, self.W_hid_to_updategate,
+             self.W_hid_to_hidden_update], axis=1)
+
+        # Stack gate biases into a (3*num_units) vector
+        b_stacked = T.concatenate(
+            [self.b_resetgate, self.b_updategate,
+             self.b_hidden_update], axis=0)
+
+        if self.precompute_input:
+            # precompute_input inputs*W. W_in is (n_features, 3*num_units).
+            # input is then (n_batch, n_time_steps, 3*num_units).
+            input = batch_norm(T.dot(input, W_in_stacked) +
+                               b_stacked)
 
         # At each call to scan, input_n will be (n_time_steps, 3*num_units).
         # We define a slicing function that extract the input to each GRU gate
