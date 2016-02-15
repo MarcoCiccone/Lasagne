@@ -1509,18 +1509,17 @@ class BNGRULayer(GRULayer):
                  inv_std=init.Constant(1),
                  **kwargs):
 
-        self.axes = axes
-        self.epsilon = epsilon
-        self.alpha = alpha
-        self.mode = mode
-        self.beta = beta
-        self.gamma = gamma
-        self.mean = mean
-        self.inv_std = inv_std
-
         # create BN layer for correct input shape
         shape_bn = (None, None, num_units)
-        self.bn = BatchNormLayer(shape_bn)
+        self.bn = BatchNormLayer(shape_bn,
+                                 axes=axes,
+                                 epsilon=epsilon,
+                                 alpha=alpha,
+                                 mode=mode,
+                                 beta=beta,
+                                 gamma=gamma,
+                                 mean=mean,
+                                 inv_std=inv_std)
         self.params.update(self.bn.params)
 
         # Initialize parent layer
@@ -1601,16 +1600,7 @@ class BNGRULayer(GRULayer):
             # precompute_input inputs*W. W_in is (n_features, 3*num_units).
             # input is then (n_batch, n_time_steps, 3*num_units).
             input = T.dot(input, W_in_stacked)
-            input = self.bn.get_output_for(
-                input,
-                axes=self.axes,
-                epsilon=self.epsilon,
-                alpha=self.alpha,
-                mode=self.mode,
-                beta=self.beta,
-                gamma=self.gamma,
-                mean=self.mean,
-                inv_std=self.inv_std)
+            input = self.bn.get_output_for(input)
 
         # At each call to scan, input_n will be (n_time_steps, 3*num_units).
         # We define a slicing function that extract the input to each GRU gate
