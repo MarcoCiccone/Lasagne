@@ -1496,6 +1496,7 @@ class BNGRULayer(GRULayer):
                  gradient_steps=-1,
                  grad_clipping=0,
                  unroll_scan=False,
+                 precompute_input=True,
                  mask_input=None,
                  only_return_final=False,
                  # Batch Normalization Params
