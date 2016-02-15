@@ -1519,9 +1519,7 @@ class BNGRULayer(GRULayer):
         self.inv_std = inv_std
 
         # create BN layer for correct input shape
-        shape_bn = incoming.get_output_shape_for()
-        shape_bn = (shape_bn[1], shape_bn[0], num_units)
-
+        shape_bn = (None, None, num_units)
         self.bn = BatchNormLayer(shape_bn)
         self.params.update(self.bn.params)
 
