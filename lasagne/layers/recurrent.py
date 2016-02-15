@@ -1541,6 +1541,20 @@ class BNGRULayer(GRULayer):
                                  inv_std=inv_std)
         self.params.update(self.bn.params)
 
+        # remove bias params that are redundant
+        if hasattr(self, 'b_updategate') and self.b_updategate is not None:
+            del self.params[self.b_updategate]
+            self.b_updategate = None
+
+        if hasattr(self, 'b_resetgate') and self.b_resetgate is not None:
+            del self.params[self.b_resetgate]
+            self.b_resetgate = None
+
+        if (hasattr(self, 'b_hidden_update') and
+                    self.b_hidden_update is not None):
+            del self.params[self.b_hidden_update]
+            self.b_hidden_update = None
+
     def get_output_for(self, inputs, **kwargs):
         """
         Override the method in order to have a Batch Normalization layer
@@ -1593,9 +1607,9 @@ class BNGRULayer(GRULayer):
              self.W_hid_to_hidden_update], axis=1)
 
         # Stack gate biases into a (3*num_units) vector
-        b_stacked = T.concatenate(
-            [self.b_resetgate, self.b_updategate,
-             self.b_hidden_update], axis=0)
+        # b_stacked = T.concatenate(
+        #     [self.b_resetgate, self.b_updategate,
+        #      self.b_hidden_update], axis=0)
 
         if self.precompute_input:
             # precompute_input inputs*W. W_in is (n_features, 3*num_units).
@@ -1620,9 +1634,9 @@ class BNGRULayer(GRULayer):
                 hid_input = theano.gradient.grad_clip(
                     hid_input, -self.grad_clipping, self.grad_clipping)
 
-            if not self.precompute_input:
-                # Compute W_{xr}x_t + b_r, W_{xu}x_t + b_u, and W_{xc}x_t + b_c
-                input_n = T.dot(input_n, W_in_stacked) + b_stacked
+            # if not self.precompute_input:
+            # # Compute W_{xr}x_t + b_r, W_{xu}x_t + b_u, and W_{xc}x_t + b_c
+            #     input_n = T.dot(input_n, W_in_stacked) + b_stacked
 
             # Reset and update gates
             resetgate = slice_w(hid_input, 0) + slice_w(input_n, 0)
@@ -1671,8 +1685,8 @@ class BNGRULayer(GRULayer):
         non_seqs = [W_hid_stacked]
         # When we aren't precomputing the input outside of scan, we need to
         # provide the input weights and biases to the step function
-        if not self.precompute_input:
-            non_seqs += [W_in_stacked, b_stacked]
+        # if not self.precompute_input:
+        #     non_seqs += [W_in_stacked, b_stacked]
 
         if self.unroll_scan:
             # Retrieve the dimensionality of the incoming layer
