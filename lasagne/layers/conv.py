@@ -1,9 +1,13 @@
+from collections import Iterable
+import numpy
 import theano.tensor as T
+from theano.sandbox.cuda.basic_ops import gpu_contiguous
 
 from .. import init
 from .. import nonlinearities
 from ..utils import as_tuple
-from ..theano_extensions import conv, padding
+from ..layers import get_output
+from ..theano_extensions import conv
 
 from .base import Layer
 
@@ -536,3 +540,119 @@ class Conv2DLayer(BaseConvLayer):
         return conved
 
 # TODO: add Conv3DLayer
+
+
+class TransposeConv2DLayer(BaseConvLayer):
+    """An upsampling Layer that transposes a convolution.
+
+    This layer upsamples its input using the transpose of a convolution,
+    also known as fractional convolution in some contexts.
+
+    Notes
+    -----
+    Expects the input to be in format: batchsize, channels, rows, cols
+    """
+    def __init__(self, incoming, num_filters, filter_size, stride=1, pad=0,
+                 untie_biases=False, W=init.GlorotUniform(),
+                 b=init.Constant(0.), nonlinearity=None, flip_filters=False,
+                 **kwargs):
+        super(TransposeConv2DLayer, self).__init__(
+            incoming, num_filters, filter_size, stride, pad, untie_biases, W,
+            b, nonlinearity, flip_filters, **kwargs)
+
+    def get_W_shape(self):
+        """Get the shape of the weight matrix `W`.
+
+        Returns
+        -------
+        tuple of int
+            The shape of the weight matrix.
+        """
+        num_input_channels = self.input_shape[1]
+        return (num_input_channels, self.num_filters) + self.filter_size
+
+    def get_output_shape_for(self, input_shape):
+        pad = self.pad if isinstance(self.pad, tuple) else (self.pad,) * self.n
+        batchsize = input_shape[0]
+        return ((batchsize, self.num_filters) +
+                tuple(transp_conv_output_length(input, filter, stride, p)
+                      for input, filter, stride, p
+                      in zip(input_shape[2:], self.filter_size,
+                             self.stride, pad)))
+
+    def get_output_for(self, input, **kwargs):
+        conved = self.convolve(input, **kwargs)
+
+        if self.b is None:
+            activation = conved
+        elif self.untie_biases:
+            # activation = conved + T.shape_padleft(self.b, 1)
+            activation = conved + self.b.dimshuffle('x', 0, 1, 2)
+        else:
+            activation = conved + self.b.dimshuffle(('x', 0) + ('x',) * self.n)
+
+        return self.nonlinearity(activation)
+
+    def convolve(self, input, **kwargs):
+        """
+        Symbolically convolves `input` with ``self.W``, producing an output of
+        shape ``self.output_shape``.
+
+        Parameters
+        ----------
+        input : Theano tensor
+            The input minibatch to convolve
+        **kwargs
+            Any additional keyword arguments from :meth:`get_output_for`
+
+        Returns
+        -------
+        Theano tensor
+            `input` convolved according to the configuration of this layer,
+            without any bias or nonlinearity applied.
+        """
+        filters = gpu_contiguous(self.W)
+        input = gpu_contiguous(input)
+        in_shape = get_output(self.input_layer).shape
+        out_shape = transp_conv_output_length(in_shape[2:], self.filter_size,
+                                              self.stride, self.pad)
+
+        op = T.nnet.abstract_conv.AbstractConv2d_gradInputs(
+            imshp=(None,) * 4,
+            kshp=self.get_W_shape(),
+            border_mode=self.pad,
+            subsample=self.stride,
+            filter_flip=self.flip_filters)
+        return op(filters, input, out_shape)
+
+
+def transp_conv_output_length(input_size, filter_size, stride, pad):
+    """Computes the length of the output of a transposed convolution
+
+    Parameters
+    ----------
+    input_size : int, Iterable or Theano tensor
+        The size of the input of the transposed convolution
+    filter_size : int, Iterable or Theano tensor
+        The size of the filter
+    stride : int, Iterable or Theano tensor
+        The stride of the transposed convolution
+    pad : int, Iterable, Theano tensor or string
+        The padding of the transposed convolution
+    """
+    if input_size is None:
+        return None
+    input_size = numpy.array(input_size)
+    filter_size = numpy.array(filter_size)
+    stride = numpy.array(stride)
+    if isinstance(pad, (int, Iterable)) and not isinstance(pad, str):
+        pad = numpy.array(pad)
+        output_size = (input_size - 1) * stride + filter_size - 2*pad
+
+    elif pad == 'full':
+        output_size = input_size * stride - filter_size - stride + 2
+    elif pad == 'valid':
+        output_size = (input_size - 1) * stride + filter_size
+    elif pad == 'same':
+        output_size = input_size
+    return output_size
