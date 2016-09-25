@@ -8,6 +8,7 @@ from .base import Layer
 from .conv import conv_output_length, BaseConvLayer
 from .pool import pool_output_length
 from ..utils import as_tuple
+import ipdb
 
 if not theano.sandbox.cuda.cuda_enabled:
     raise ImportError(
@@ -21,6 +22,7 @@ elif not dnn.dnn_available():
 
 
 __all__ = [
+    "BatchNormDNNLayer",
     "Pool2DDNNLayer",
     "MaxPool2DDNNLayer",
     "Pool3DDNNLayer",
@@ -591,3 +593,120 @@ class SpatialPyramidPoolingDNNLayer(Layer):
     def get_output_shape_for(self, input_shape):
         num_features = sum(p*p for p in self.pool_dims)
         return (input_shape[0], input_shape[1], num_features)
+
+
+class BatchNormDNNLayer(Layer):
+    def __init__(self, incoming, mode='spatial', epsilon=1e-4, alpha=0.1,
+                 beta=init.Constant(0), gamma=init.Constant(1),
+                 mean=init.Constant(0), inv_std=init.Constant(1), **kwargs):
+        super(BatchNormDNNLayer, self).__init__(incoming, **kwargs)
+
+        assert mode in ('per-activation', 'spatial'), \
+            "Mode parameter should be 'per-activation' or 'spatial'"
+
+        if mode == 'per-activation':
+            self.axes = (0,)
+        elif mode == 'spatial':
+            self.axes = (0,) + tuple(range(2, len(self.input_shape)))
+
+        self.mode = mode
+        self.epsilon = epsilon
+        self.alpha = alpha
+
+        # create parameters, ignoring all dimensions in axes
+        shape = [size for axis, size in enumerate(self.input_shape)
+                 if axis not in self.axes]
+        if any(size is None for size in shape):
+            raise ValueError("BatchNormLayer needs specified input sizes for "
+                             "all axes not normalized over.")
+        if beta is None:
+            self.beta = None
+        else:
+            self.beta = self.add_param(beta, shape, 'beta',
+                                       trainable=True, regularizable=False)
+        if gamma is None:
+            self.gamma = None
+        else:
+            self.gamma = self.add_param(gamma, shape, 'gamma',
+                                        trainable=True, regularizable=True)
+
+        self.mean = self.add_param(mean, shape, 'mean',
+                                   trainable=False, regularizable=False)
+        self.inv_std = self.add_param(inv_std, shape, 'inv_std',
+                                      trainable=False, regularizable=False)
+
+    def get_output_for(self, input, deterministic=False,
+                       batch_norm_use_averages=None,
+                       batch_norm_update_averages=None, **kwargs):
+        # Decide whether to use the stored averages or mini-batch statistics
+        if batch_norm_use_averages is None:
+            batch_norm_use_averages = deterministic
+        use_averages = batch_norm_use_averages
+
+        # Decide whether to update the stored averages
+        if batch_norm_update_averages is None:
+            batch_norm_update_averages = not deterministic
+        update_averages = batch_norm_update_averages
+
+        # prepare dimshuffle pattern inserting broadcastable axes as needed
+        param_axes = iter(range(input.ndim - len(self.axes)))
+        pattern = ['x' if input_axis in self.axes
+                   else next(param_axes)
+                   for input_axis in range(input.ndim)]
+
+        gamma = 1 if self.gamma is None else self.gamma.dimshuffle(pattern)
+        beta = 0 if self.beta is None else self.beta.dimshuffle(pattern)
+
+        if not deterministic:
+            (normalized,
+             input_mean,
+             input_inv_std) = dnn.dnn_batch_normalization_train(input,
+                                                                gamma,
+                                                                beta,
+                                                                self.mode,
+                                                                self.epsilon)
+        if use_averages:
+            mean = self.mean
+            inv_std = self.inv_std
+        else:
+            mean = input_mean
+            inv_std = input_inv_std
+
+        if update_averages:
+            # Trick: To update the stored statistics, we create memory-aliased
+            # clones of the stored statistics:
+            running_mean = theano.clone(self.mean, share_inputs=False)
+            running_inv_std = theano.clone(self.inv_std, share_inputs=False)
+            # set a default update for them:
+            running_mean.default_update = ((1 - self.alpha) * running_mean +
+                                           self.alpha * input_mean)
+            running_inv_std.default_update = ((1 - self.alpha) *
+                                              running_inv_std +
+                                              self.alpha * input_inv_std)
+            # and make sure they end up in the graph without participating in
+            # the computation (this way their default_update will be collected
+            # and applied, but the computation will be optimized away):
+            mean += 0 * running_mean
+            inv_std += 0 * running_inv_std
+
+        if deterministic:
+            normalized = (input - mean) * (gamma * inv_std) + beta
+
+        return normalized
+
+
+def batch_normDNN(layer, **kwargs):
+    nonlinearity = getattr(layer, 'nonlinearity', None)
+    if nonlinearity is not None:
+        layer.nonlinearity = nonlinearities.identity
+    if hasattr(layer, 'b') and layer.b is not None:
+        del layer.params[layer.b]
+        layer.b = None
+    bn_name = (kwargs.pop('name', None) or
+               (getattr(layer, 'name', None) and layer.name + '_bn'))
+    layer = BatchNormDNNLayer(layer, name=bn_name, **kwargs)
+    if nonlinearity is not None:
+        from .special import NonlinearityLayer
+        nonlin_name = bn_name and bn_name + '_nonlin'
+        layer = NonlinearityLayer(layer, nonlinearity, name=nonlin_name)
+    return layer
