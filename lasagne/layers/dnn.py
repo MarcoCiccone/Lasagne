@@ -1,5 +1,5 @@
 import theano
-from theano.sandbox.cuda import dnn
+from theano.gpuarray import dnn
 
 from .. import init
 from .. import nonlinearities
@@ -10,16 +10,11 @@ from .pool import pool_output_length
 from .normalization import BatchNormLayer
 from ..utils import as_tuple
 
-if not theano.sandbox.cuda.cuda_enabled:
-    raise ImportError(
-            "requires GPU support -- see http://lasagne.readthedocs.org/en/"
-            "latest/user/installation.html#gpu-support")  # pragma: no cover
-elif not dnn.dnn_available():
+if not dnn.dnn_present():
     raise ImportError(
             "cuDNN not available: %s\nSee http://lasagne.readthedocs.org/en/"
             "latest/user/installation.html#cudnn" %
             dnn.dnn_available.msg)  # pragma: no cover
-
 
 __all__ = [
     "Pool2DDNNLayer",
@@ -29,6 +24,7 @@ __all__ = [
     "Conv2DDNNLayer",
     "Conv3DDNNLayer",
     "SpatialPyramidPoolingDNNLayer",
+    "GRUDNNLayer",
     "BatchNormDNNLayer",
     "batch_norm_dnn",
 ]
@@ -787,3 +783,199 @@ if not hasattr(dnn, 'dnn_batch_normalization_train'):
     del BatchNormDNNLayer, batch_norm_dnn
     __all__.remove('BatchNormDNNLayer')
     __all__.remove('batch_norm_dnn')
+
+
+class GRUDNNLayer(Layer):
+    def __init__(self, incoming, num_units,
+                 resetgate=Gate(W_cell=None),
+                 updategate=Gate(W_cell=None),
+                 hidden_update=Gate(W_cell=None,
+                                    nonlinearity=nonlinearities.tanh),
+                 hid_init=init.Constant(0.),  # initial states
+                 input_mode='linear',  # {'skip', 'linear'}
+                 # dropout=0.
+                 # backwards=False,
+                 # learn_init=False,
+                 # gradient_steps=-1,
+                 # grad_clipping=0,
+                 # unroll_scan=False,
+                 # precompute_input=True,
+                 # mask_input=None,
+                 is_bidirectional=False,
+                 only_return_final=False,
+                 **kwargs):
+
+        # Initialize parent layer
+        super(GRUDNNLayer, self).__init__(incoming,**kwargs)
+
+        # This layer inherits from a MergeLayer, because it can have three
+        # inputs - the layer input, the mask and the initial hidden state.  We
+        # will just provide the layer input as incomings, unless a mask input
+        # or initial hidden state was provided.
+        self.depth = 1
+        self.num_units = num_units
+        self.only_return_final = only_return_final
+
+        # Retrieve the dimensionality of the incoming layer
+        input_shape = self.input_shape
+
+        # Input dimensionality is the output dimensionality of the input layer
+        num_inputs = np.prod(input_shape[2:])
+        self.batch_size = input_shape[0]
+        self.num_inputs = num_inputs
+        self.input_mode = input_mode
+        self.num_dirs = 2 if is_bidirectional else 1
+        self.direction_mode = 'bidirectional' if is_bidirectional else 'unidirectional'
+
+        # cudnn_parameters: vector contain all flatten weights and bias
+
+        def add_gate_params(gate, gate_name):
+            """ Convenience function for adding layer parameters from a Gate
+            instance. """
+            return (self.add_param(gate.W_in, (num_inputs, num_units),
+                                   name="W_in_to_{}".format(gate_name)),
+                    self.add_param(gate.W_hid, (num_units, num_units),
+                                   name="W_hid_to_{}".format(gate_name)),
+
+                    # we add a gate because in cudnn is implemented like this
+                    self.add_param(gate.b, (num_units,),
+                                   name="b_in_{}".format(gate_name),
+                                   regularizable=False),
+                    self.add_param(gate.b, (num_units,),
+                                   name="b_hid_{}".format(gate_name),
+                                   regularizable=False),
+                    gate.nonlinearity)
+
+        # Add in all parameters from gates
+
+        # Reset gates
+        (self.W_in_to_resetgate, self.W_hid_to_resetgate,
+         self.b_in_resetgate, self.b_hid_resetgate,
+         self.nonlinearity_resetgate) = add_gate_params(resetgate, 'resetgate')
+
+        # Update gates
+        (self.W_in_to_updategate, self.W_hid_to_updategate,
+         self.b_in_updategate, self.b_hid_updategate,
+         self.nonlinearity_updategate) = add_gate_params(updategate,
+                                                         'updategate')
+
+        # Hidden state / Memory updates
+        (self.W_in_to_hidden_update, self.W_hid_to_hidden_update,
+         self.b_in_hidden_update, self.b_hid_hidden_update,
+         self.nonlinearity_hid) = add_gate_params(hidden_update,
+                                                  'hidden_update')
+
+        self.rnnb = dnn.RNNBlock(theano.config.floatX,
+                                 self.num_units,
+                                 self.depth,
+                                 'gru',
+                                 input_mode=self.input_mode,
+                                 direction_mode=self.direction_mode)
+
+        # psize = self.rnnb.get_param_size([self.batch_size, self.num_inputs])
+        # print(psize)
+
+        # prepare cudnn parameters
+        self.cudnn_parameters = theano.tensor.concatenate([
+            # input reset  (W, b)
+            theano.tensor.flatten(self.W_in_to_resetgate),
+            theano.tensor.flatten(self.b_in_resetgate),
+            # input update (W, b)
+            theano.tensor.flatten(self.W_in_to_updategate),
+            theano.tensor.flatten(self.b_in_updategate),
+            # input newmem (W, b)
+            theano.tensor.flatten(self.W_in_to_hidden_update),
+            theano.tensor.flatten(self.b_in_hidden_update),
+            # recur reset  (W, b)
+            theano.tensor.flatten(self.W_hid_to_resetgate),
+            theano.tensor.flatten(self.b_hid_resetgate),
+            # recur update (W, b)
+            theano.tensor.flatten(self.W_hid_to_updategate),
+            theano.tensor.flatten(self.b_hid_updategate),
+            # recur newmem (W, b)
+            theano.tensor.flatten(self.W_hid_to_hidden_update),
+            theano.tensor.flatten(self.b_hid_hidden_update)
+        ])
+
+        if is_bidirectional:
+            resetgate_back = Gate(W_cell=None)
+            updategate_back = Gate(W_cell=None)
+            hidden_update_back = Gate(W_cell=None,
+                                      nonlinearity=nonlinearities.tanh)
+            # Reset gates
+            (self.W_in_to_resetgate_back, self.W_hid_to_resetgate_back,
+             self.b_in_resetgate_back, self.b_hid_resetgate_back,
+             self.nonlinearity_resetgate_back) = add_gate_params(
+                 resetgate_back, 'resetgate_back')
+
+            (self.W_in_to_updategate_back, self.W_hid_to_updategate_back,
+             self.b_in_updategate_back, self.b_hid_updategate_back,
+             self.nonlinearity_updategate_back) = add_gate_params(
+                 updategate_back, 'updategate_back')
+
+            # Hidden state / Memory updates
+            (self.W_in_to_hidden_update_back, self.W_hid_to_hidden_update_back,
+             self.b_in_hidden_update_back, self.b_hid_hidden_update_back,
+             self.nonlinearity_hid_back) = add_gate_params(
+                 hidden_update_back, 'hidden_update_back')
+
+            self.cudnn_parameters = theano.tensor.concatenate([
+                self.cudnn_parameters,
+                # input reset  (W, b)
+                theano.tensor.flatten(self.W_in_to_resetgate_back),
+                theano.tensor.flatten(self.b_in_resetgate_back),
+                # input update (W, b)
+                theano.tensor.flatten(self.W_in_to_updategate_back),
+                theano.tensor.flatten(self.b_in_updategate_back),
+                # input newmem (W, b)
+                theano.tensor.flatten(self.W_in_to_hidden_update_back),
+                theano.tensor.flatten(self.b_in_hidden_update_back),
+                # recur reset  (W, b)
+                theano.tensor.flatten(self.W_hid_to_resetgate_back),
+                theano.tensor.flatten(self.b_hid_resetgate_back),
+                # recur update (W, b)
+                theano.tensor.flatten(self.W_hid_to_updategate_back),
+                theano.tensor.flatten(self.b_hid_updategate_back),
+                # recur newmem (W, b)
+                theano.tensor.flatten(self.W_hid_to_hidden_update_back),
+                theano.tensor.flatten(self.b_hid_hidden_update_back)
+            ])
+
+    def get_output_shape_for(self, input_shapes):
+        # The shape of the input to this layer will be the first element
+        # of input_shapes, whether or not a mask input is being used.
+        # input_shape = input_shapes[0]
+        # When only_return_final is true, the second (sequence step) dimension
+        # will be flattened
+        if self.only_return_final:
+            return self.input_shape[0], self.num_units * self.num_dirs
+        # Otherwise, the shape will be (n_batch, n_steps, num_units)
+        else:
+            return self.input_shape[0], self.input_shape[1], self.num_units * self.num_dirs
+
+    def get_output_for(self, input, **kwargs):
+        # Treat all dimensions after the second as flattened feature dimensions
+        if input.ndim > 3:
+            input = theano.tensor.flatten(input, 3)
+
+        # Because scan iterates over the first dimension we dimshuffle to
+        # (n_time_steps, n_batch, n_features)
+        input = input.dimshuffle(1, 0, 2)
+        seq_len, num_batch, _ = input.shape
+        # Initiliaze hidden states
+        self.h0 = theano.tensor.zeros((self.depth * self.num_dirs,
+                                       num_batch,
+                                       self.num_units))
+
+        # compute rnn
+        hid_out = self.rnnb.apply(w=self.cudnn_parameters, x=input,
+                                  hx=self.h0)[0]
+
+        # When it is requested that we only return the final sequence step,
+        # we need to slice it out immediately after scan is applied
+        if self.only_return_final:
+            hid_out = hid_out[-1]  # (n_batch, n_features)
+        else:
+            # dimshuffle back to (n_batch, n_time_steps, n_features)
+            hid_out = hid_out.dimshuffle(1, 0, 2)
+        return hid_out
