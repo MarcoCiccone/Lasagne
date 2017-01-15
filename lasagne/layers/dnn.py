@@ -1,4 +1,5 @@
 import theano
+import numpy as np
 from theano.gpuarray import dnn
 
 from .. import init
@@ -8,6 +9,7 @@ from .base import Layer
 from .conv import conv_output_length, BaseConvLayer
 from .pool import pool_output_length
 from .normalization import BatchNormLayer
+from .recurrent import Gate
 from ..utils import as_tuple
 
 if not dnn.dnn_present():
